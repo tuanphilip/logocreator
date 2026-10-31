@@ -18,11 +18,11 @@ const satoshi = localFont({
   fallback: ["ui-sans-serif", "system-ui", "sans-serif"],
 });
 
-const title = "LogoCreator: Generate a logo in seconds";
+const title = "LogoStudio by Tuan Philip — AI Logo & Brand Generator";
 const description =
-  "Create a clean, professional logo for your brand in seconds. Free and open source.";
-const canonicalUrl = "https://www.logo-creator.io/";
-const sitename = "LogoCreator";
+  "Generate professional, vector-ready logos for your brand in seconds with FLUX AI. Built by Tuan Philip.";
+const canonicalUrl = "https://tuanphilip.github.io/";
+const sitename = "LogoStudio by Tuan Philip";
 
 // Resolve the OG/Twitter card image against the origin actually serving THIS
 // build, not a hardcoded canonical domain. Pointing the card at

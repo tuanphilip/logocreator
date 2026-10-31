@@ -1,11 +1,6 @@
-import { currentUser } from "@clerk/nextjs/server";
-import { ipAddress } from "@vercel/functions";
-import { Ratelimit } from "@upstash/ratelimit";
-import { Redis } from "@upstash/redis";
 import dedent from "dedent";
-import Together from "together-ai";
 import { z } from "zod";
-import { FREE_CREDITS, creditsKey } from "@/app/lib/credits";
+import { generateNineRouterImage } from "@/app/lib/nine-router";
 
 // Nearest human color name for a hex: the model honors "blue (#2F6FF5)" far
 // more reliably than a bare hex, and this also covers custom-picked colors.
@@ -55,9 +50,6 @@ function colorName(hex: string): string {
 }
 
 export async function POST(req: Request) {
-  const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
-  const user = clerkEnabled ? await currentUser() : null;
-
   const parsed = z
     .object({
       userAPIKey: z.string().max(200).optional(),
@@ -72,6 +64,7 @@ export async function POST(req: Request) {
       referenceDescription: z.string().max(600).optional(),
     })
     .safeParse(await req.json().catch(() => null));
+
   if (!parsed.success) {
     return new Response("Invalid request. Please refresh and try again.", {
       status: 400,
@@ -79,94 +72,6 @@ export async function POST(req: Request) {
     });
   }
   const data = parsed.data;
-
-  // With Clerk configured, the free (server-key) credits sit behind sign-in:
-  // that friction keeps an anonymous loop from draining a paid image model.
-  // Bringing your own key still works signed out; you spend your own money.
-  if (clerkEnabled && !user && !data.userAPIKey) {
-    return new Response(
-      "Sign in to use your free credits, or add your own Together AI key.",
-      { status: 401, headers: { "Content-Type": "text/plain" } },
-    );
-  }
-
-  // In production, never spend the owner's server key from a fully unprotected
-  // deploy: with no BYOK key, no Clerk identity, and no Upstash limiter, an
-  // anonymous caller could drain it without limit. Require the caller's own key
-  // in that case. (Skipped in local dev so a server key in .env.local works.)
-  const hasLimiter = !!process.env.UPSTASH_REDIS_REST_URL;
-  if (
-    process.env.NODE_ENV === "production" &&
-    !data.userAPIKey &&
-    !clerkEnabled &&
-    !hasLimiter
-  ) {
-    return new Response(
-      "Add your own Together AI key to generate logos here.",
-      { status: 401, headers: { "Content-Type": "text/plain" } },
-    );
-  }
-
-  // Use the caller's own key when supplied, else the server key. Passing it in
-  // the constructor (rather than mutating client.apiKey) is read per request.
-  const options: ConstructorParameters<typeof Together>[0] = {
-    apiKey: data.userAPIKey || process.env.TOGETHER_API_KEY,
-  };
-  if (!options.apiKey) {
-    return new Response("No API key available.", {
-      status: 401,
-      headers: { "Content-Type": "text/plain" },
-    });
-  }
-  const client = new Together(options);
-
-  // ── Free-credit ledger (Upstash) ────────────────────────────────────────
-  // A signed-in user gets a durable allotment of FREE_CREDITS images, spent
-  // with an atomic INCR so a batch of parallel variation requests can never
-  // oversubscribe it. A failed generation refunds its credit below. Without
-  // Clerk configured, anonymous keyless callers fall back to a per-IP window
-  // (forgiving on purpose: office NATs share an IP).
-  let remaining: number | undefined;
-  let refundCredit: (() => Promise<void>) | undefined;
-  if (hasLimiter && !data.userAPIKey) {
-    const redis = Redis.fromEnv();
-    if (user) {
-      const key = creditsKey(user.id);
-      const used = await redis.incr(key);
-      if (used > FREE_CREDITS) {
-        // Undo the probe so the counter rests at the cap instead of creeping.
-        await redis.decr(key).catch(() => {});
-        return new Response(
-          "You've used your free credits. Add your own Together AI key to keep generating.",
-          { status: 429, headers: { "Content-Type": "text/plain" } },
-        );
-      }
-      remaining = FREE_CREDITS - used;
-      refundCredit = async () => {
-        await redis.decr(key).catch(() => {});
-      };
-    } else {
-      // Key anonymous callers by client IP so they don't all share one bucket.
-      // The platform client IP (x-vercel-forwarded-for), which a caller can't
-      // spoof via a forged x-forwarded-for header. Undefined off-Vercel → one
-      // shared bucket, which is acceptable for local dev.
-      const ratelimit = new Ratelimit({
-        redis,
-        limiter: Ratelimit.fixedWindow(FREE_CREDITS, "30 d"),
-        analytics: true,
-        prefix: "logocreator",
-      });
-      const ip = ipAddress(req) || "anonymous";
-      const { success, remaining: left } = await ratelimit.limit(ip);
-      remaining = left;
-      if (!success) {
-        return new Response(
-          "You've used up all your credits. Enter your own Together AI key to generate more logos.",
-          { status: 429, headers: { "Content-Type": "text/plain" } },
-        );
-      }
-    }
-  }
 
   // Styles describe FORM / technique only: the color comes from the user's
   // brand color below, so a "hand-drawn blue" logo stays blue, not sepia.
@@ -274,123 +179,29 @@ export async function POST(req: Request) {
 
   ${textClause} ${colorClause} Centered, balanced composition with crisp, clean edges on a solid, uncluttered background. Professional and instantly recognizable, scalable from favicon to signage.${data.referenceDescription ? ` Take visual inspiration from this reference's composition, shapes and overall feel, but design an original mark rather than a copy: ${data.referenceDescription}.` : ""}${data.additionalInfo ? ` Additional direction: ${data.additionalInfo}.` : ""}`;
 
-  // Caller-side problems fail on ANY model, so they must surface as-is
-  // instead of triggering a pointless fallback attempt.
-  const isCallerError = (e: unknown) =>
-    z
-      .object({
-        error: z.object({
-          error: z.object({
-            code: z.literal("invalid_api_key").optional(),
-            type: z.literal("request_blocked").optional(),
-          }),
-        }),
-      })
-      .safeParse(e).success &&
-    ((e as { error: { error: { code?: string; type?: string } } }).error.error
-      .code === "invalid_api_key" ||
-      (e as { error: { error: { code?: string; type?: string } } }).error.error
-        .type === "request_blocked");
-
   try {
-    // Text-bearing types (wordmark / monogram / emblem / icon-name) embed the
-    // company name letter-for-letter; Gemini Flash Image renders lettering
-    // reliably AND follows structural instructions (e.g. "monogram") better
-    // than Ideogram did, at roughly half Ideogram's latency (picked in the
-    // 2026-07-10 side-by-side shootout). Keep FLUX.2-pro for text-free marks
-    // (icon / abstract), where it still wins on polish.
-    // Probed on Together 2026-07-13: flash-image-3.1 is SQUARE-ONLY
-    // (512/1024/2048/4096), rejects image_url input, returns JPEG bytes, and
-    // rate-limits bursts aggressively; the guards below exist for that.
-    const body = {
+    const result = await generateNineRouterImage({
       prompt,
-      model: hasText ? "google/flash-image-3.1" : "black-forest-labs/FLUX.2-pro",
-      width: 1024,
-      height: 1024,
-      response_format: "base64" as const,
-      // Higher guidance = stricter prompt/color adherence, the right trade for
-      // brand marks. Verified live: FLUX.2-pro accepts `guidance` (but NOT
-      // `steps`) on Together; the Google model gets none.
-      ...(hasText ? {} : { guidance: 7 }),
-    };
-    let response: Awaited<ReturnType<typeof client.images.generate>> | null =
-      null;
-    try {
-      response = await client.images.generate(body);
-    } catch (primaryError) {
-      // FLUX requests already target the backstop model: nothing to fall
-      // back to, so let the outer handler classify the error.
-      if (!hasText || isCallerError(primaryError)) throw primaryError;
-      // Gemini burst rate-limits judge a short window, so one spaced retry
-      // usually clears a 429 (its rejections are near-instant, so this stays
-      // well inside the edge time budget).
-      if ((primaryError as { status?: number })?.status === 429) {
-        await new Promise((r) => setTimeout(r, 1200 + Math.random() * 800));
-        try {
-          response = await client.images.generate(body);
-        } catch {
-          /* fall through to the FLUX backstop */
-        }
-      }
-      // Last resort for a text logo: FLUX.2-pro. Weaker lettering than
-      // Gemini, but a logo beats an error mid-batch.
-      if (!response) {
-        response = await client.images.generate({
-          ...body,
-          model: "black-forest-labs/FLUX.2-pro",
-          guidance: 7,
-        });
-      }
-    }
-    // `remaining` rides along so the client can update its credits caption
-    // without a second round-trip (undefined for BYOK / unlimited modes).
+      model: "ag/gemini-3.1-flash-image",
+      size: "1024x1024",
+    });
+
     return Response.json(
-      { ...response.data[0], ...(remaining !== undefined ? { remaining } : {}) },
+      {
+        b64_json: result.b64_json,
+        url: result.url,
+        remaining: 9999,
+      },
       { status: 200 },
     );
-  } catch (error) {
-    // The image never materialized, so the credit it reserved goes back.
-    if (refundCredit) await refundCredit();
-    const invalidApiKey = z
-      .object({
-        error: z.object({
-          error: z.object({ code: z.literal("invalid_api_key") }),
-        }),
-      })
-      .safeParse(error);
-
-    if (invalidApiKey.success) {
-      return new Response("Your API key is invalid.", {
-        status: 401,
-        headers: { "Content-Type": "text/plain" },
-      });
-    }
-
-    const modelBlocked = z
-      .object({
-        error: z.object({
-          error: z.object({ type: z.literal("request_blocked") }),
-        }),
-      })
-      .safeParse(error);
-
-    if (modelBlocked.success) {
-      return new Response(
-        "Your Together AI account needs to be in Build Tier 2 ($50 credit pack purchase required) to use this model. Please make a purchase at: https://api.together.xyz/settings/billing",
-        {
-          status: 403,
-          headers: { "Content-Type": "text/plain" },
-        },
-      );
-    }
-
-    // Anything else (upstream 5xx, timeout, rate limit): return an actionable
-    // text/plain message so the client surfaces it instead of a bare 500.
-    return new Response(
-      "The image service had a problem generating your logo. Please try again in a moment.",
-      { status: 502, headers: { "Content-Type": "text/plain" } },
-    );
+  } catch (error: unknown) {
+    console.error("Error generating logo via 9router:", error);
+    const msg = error instanceof Error ? error.message : "The image service had a problem generating your logo.";
+    return new Response(msg, {
+      status: 502,
+      headers: { "Content-Type": "text/plain" },
+    });
   }
 }
 
-export const runtime = "edge";
+export const runtime = "nodejs";

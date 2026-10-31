@@ -1,20 +1,5 @@
-import { currentUser } from "@clerk/nextjs/server";
-import { ipAddress } from "@vercel/functions";
-import { Ratelimit } from "@upstash/ratelimit";
-import { Redis } from "@upstash/redis";
 import { z } from "zod";
-
-/**
- * Reads an uploaded reference logo with a Together vision model and returns a
- * compact, structured read the creator can act on (description + a style/color
- * guess that pre-selects the matching controls). The image is forwarded only to
- * Together via this route and never persisted.
- *
- * Model is a single const for easy swapping. Confirmed available on Together:
- * Qwen2.5-VL-72B (primary), or meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP4.
- * Uses a direct fetch to /chat/completions (de-risks the pinned SDK's chat API).
- */
-const REFERENCE_MODEL = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP4";
+import { queryNineRouterVision } from "@/app/lib/nine-router";
 
 const STYLES = [
   "Minimal",
@@ -37,9 +22,7 @@ Return only the JSON object.`;
 export async function POST(req: Request) {
   const parsed = z
     .object({
-      userAPIKey: z.string().max(200).optional(),
-      // Only an inline image data URL, never an arbitrary http/file URL (which
-      // the model backend would otherwise fetch server-side on our behalf).
+      userAPIKey: z.string().optional(),
       image: z
         .string()
         .regex(
@@ -48,6 +31,7 @@ export async function POST(req: Request) {
         ),
     })
     .safeParse(await req.json().catch(() => null));
+
   if (!parsed.success) {
     return new Response("Invalid request.", {
       status: 400,
@@ -56,132 +40,37 @@ export async function POST(req: Request) {
   }
   const data = parsed.data;
 
-  // Cap payload size (~4 MB image) before forwarding it to the vision model.
-  if (data.image.length > 6_000_000) {
+  // Cap payload size (~6 MB image)
+  if (data.image.length > 8_000_000) {
     return new Response("That image is too large.", {
       status: 413,
       headers: { "Content-Type": "text/plain" },
     });
   }
 
-  // With Clerk configured, keyless (server-key) reads require a signed-in
-  // user, the same friction as generations; BYOK works signed out.
-  const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
-  if (clerkEnabled && !data.userAPIKey) {
-    const user = await currentUser();
-    if (!user) {
-      return new Response(
-        "Sign in to read references with free credits, or add your own Together AI key.",
-        { status: 401, headers: { "Content-Type": "text/plain" } },
-      );
-    }
-  }
-
-  // In production, don't spend the owner's server key from a fully unprotected
-  // deploy (no BYOK, no Clerk, no Upstash limiter). Allowed in local dev.
-  const hasLimiter = !!process.env.UPSTASH_REDIS_REST_URL;
-  if (
-    process.env.NODE_ENV === "production" &&
-    !data.userAPIKey &&
-    !clerkEnabled &&
-    !hasLimiter
-  ) {
-    return new Response(
-      "Add your own Together AI key to read references here.",
-      { status: 401, headers: { "Content-Type": "text/plain" } },
-    );
-  }
-
-  // Rate-limit anonymous, server-key reads per client IP so the shared key
-  // cannot be drained in a loop. BYOK callers spend their own key, so skip.
-  if (hasLimiter && !data.userAPIKey) {
-    const ratelimit = new Ratelimit({
-      redis: Redis.fromEnv(),
-      limiter: Ratelimit.fixedWindow(40, "1 d"),
-      analytics: true,
-      prefix: "logocreator-read",
-    });
-    const ip = ipAddress(req) || "anonymous";
-    const { success } = await ratelimit.limit(ip);
-    if (!success) {
-      return new Response(
-        "You've hit the free reference-read limit for now. Add your own Together AI key to keep going.",
-        { status: 429, headers: { "Content-Type": "text/plain" } },
-      );
-    }
-  }
-
-  const apiKey = data.userAPIKey?.trim() || process.env.TOGETHER_API_KEY;
-  if (!apiKey) {
-    return new Response("No API key available.", {
-      status: 401,
-      headers: { "Content-Type": "text/plain" },
-    });
-  }
-
-  const baseURL = "https://api.together.xyz/v1";
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
-
   try {
-    const res = await fetch(`${baseURL}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: REFERENCE_MODEL,
-        max_tokens: 320,
-        temperature: 0.2,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: PROMPT },
-              { type: "image_url", image_url: { url: data.image } },
-            ],
-          },
-        ],
-      }),
+    const rawText = await queryNineRouterVision({
+      model: "ag/gemini-3.8-flash-medium",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: PROMPT },
+            { type: "image_url", image_url: { url: data.image } },
+          ],
+        },
+      ],
     });
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      if (res.status === 401) {
-        return new Response("Your API key is invalid.", {
-          status: 401,
-          headers: { "Content-Type": "text/plain" },
-        });
-      }
-      if (/non-serverless|model_not_available/i.test(body)) {
-        return new Response(
-          "Reading references needs serverless chat access on your Together account (image generation still works). Check your plan at api.together.ai.",
-          { status: 403, headers: { "Content-Type": "text/plain" } },
-        );
-      }
-      if (/request_blocked|tier|not allowed/i.test(body)) {
-        return new Response(
-          "Your Together account tier doesn't allow this model yet.",
-          { status: 403, headers: { "Content-Type": "text/plain" } },
-        );
-      }
-      return new Response("Couldn't read that image. Try another file.", {
-        status: 502,
-        headers: { "Content-Type": "text/plain" },
-      });
-    }
-
-    const out = await res.json();
-    const text: string = out?.choices?.[0]?.message?.content ?? "";
-
-    let parsed: Record<string, unknown> = {};
+    let parsedOut: Record<string, unknown> = {};
+    const text = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, "$1").trim();
     try {
-      parsed = JSON.parse(text);
+      parsedOut = JSON.parse(text);
     } catch {
       const m = text.match(/\{[\s\S]*\}/);
       if (m) {
         try {
-          parsed = JSON.parse(m[0]);
+          parsedOut = JSON.parse(m[0]);
         } catch {
           /* fall through to text-only */
         }
@@ -189,21 +78,21 @@ export async function POST(req: Request) {
     }
 
     const styleGuess =
-      typeof parsed.styleGuess === "string" &&
-      (STYLES as readonly string[]).includes(parsed.styleGuess)
-        ? parsed.styleGuess
+      typeof parsedOut.styleGuess === "string" &&
+      (STYLES as readonly string[]).includes(parsedOut.styleGuess as (typeof STYLES)[number])
+        ? parsedOut.styleGuess
         : null;
     const dominantColor =
-      typeof parsed.dominantColor === "string" &&
-      /^#[0-9a-fA-F]{6}$/.test(parsed.dominantColor)
-        ? parsed.dominantColor
+      typeof parsedOut.dominantColor === "string" &&
+      /^#[0-9a-fA-F]{6}$/.test(parsedOut.dominantColor)
+        ? parsedOut.dominantColor
         : "auto";
     const description =
-      typeof parsed.description === "string" && parsed.description.trim()
-        ? parsed.description.trim().slice(0, 240)
+      typeof parsedOut.description === "string" && parsedOut.description.trim()
+        ? parsedOut.description.trim().slice(0, 240)
         : text.replace(/[{}"]/g, " ").trim().slice(0, 240);
-    const keywords = Array.isArray(parsed.keywords)
-      ? parsed.keywords
+    const keywords = Array.isArray(parsedOut.keywords)
+      ? parsedOut.keywords
           .filter((k): k is string => typeof k === "string")
           .slice(0, 6)
       : [];
@@ -212,7 +101,8 @@ export async function POST(req: Request) {
       { description, styleGuess, dominantColor, keywords },
       { status: 200 },
     );
-  } catch {
+  } catch (error: unknown) {
+    console.error("Error reading reference via 9router:", error);
     return new Response("Couldn't read that image. Try another file.", {
       status: 502,
       headers: { "Content-Type": "text/plain" },
@@ -220,4 +110,4 @@ export async function POST(req: Request) {
   }
 }
 
-export const runtime = "edge";
+export const runtime = "nodejs";

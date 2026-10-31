@@ -471,15 +471,7 @@ export default function Page() {
     // tick cross-fades the two dialog overlays, and their combined opacity dips
     // mid-transition, flashing the gallery through. Behind the new overlay the
     // lightbox close is invisible, so the swap reads as one smooth step.
-    if (brandKit.savedKitIds.has(gen.id) || userAPIKey.trim()) {
-      brandKit.start(gen);
-    } else if (auth.enabled && !auth.isSignedIn) {
-      // Keys are an account feature: signing in comes first.
-      setWelcomeOpen(true);
-    } else {
-      setPendingBrandKitGen(gen);
-      setApiKeyOpen(true);
-    }
+    brandKit.start(gen);
     window.setTimeout(() => setActiveGen(null), 220);
   }
 
@@ -1592,7 +1584,7 @@ export default function Page() {
             </Tip>
             <Tip label="GitHub">
               <a
-                href="https://github.com/Nutlope/logocreator"
+                href="https://github.com/tuanphilip/logocreator"
                 target="_blank"
                 rel="noreferrer"
                 aria-label="GitHub"
@@ -1601,9 +1593,9 @@ export default function Page() {
                 <Github className="size-3.5" />
               </a>
             </Tip>
-            <Tip label="X (Twitter)">
+            <Tip label="Portfolio">
               <a
-                href="https://x.com/nutlope"
+                href="https://tuanphilip.github.io/"
                 target="_blank"
                 rel="noreferrer"
                 aria-label="X (Twitter)"
